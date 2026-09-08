@@ -105,7 +105,8 @@ Helper functions:
 ### Collision Check
 
 - `world.check(transforms, pairs)` → `(N, n_pairs)` bool array
-- `world.check_any(transforms, pairs)` → first collision index or None (early-exit)
+- `world.check_any(transforms, pairs)` → any collision index or None (early-exit)
+- `world.check_first(transforms, pairs)` → first collision index or None (early-exit)
 
 **Transform validation**: every 4x4 transform must be rigid - proper rotation (orthonormal, determinant +1) in the 3x3 block, `[0, 0, 0, 1]` bottom row, all entries finite. Violations raise `ValueError` at the Python boundary; NaN/Inf poses are rejected rather than silently answered. Orthonormality tolerance is 1e-6.
 
@@ -153,4 +154,4 @@ Supports both `to_bytes()`/`from_bytes()` and pickle protocol.
 4. **No Python in hot loop**: All batch work happens in Rust
 5. **Static group caching**: Static group transforms applied once, not per pose
 6. **Distance thresholds**: `min_distance > 0` uses `distance()` query; `min_distance = 0` uses faster `intersection_test()`
-7. **Early-exit**: `check_any()` uses `find_any()` to stop at first collision
+7. **Early-exit**: `check_any()` uses `find_any()` to stop at first collision found; `check_first()` uses `find_first()` to stop at the very first collision

@@ -251,6 +251,20 @@ class CollisionWorld:
         """
         return self._internal.check_any(transforms, pairs)
 
+    def check_first(
+        self,
+        transforms: TransformDict,
+        pairs: PairList,
+    ) -> Optional[int]:
+        """
+        Check for the first collision along transforms.
+
+        :param transforms: Dict mapping dynamic group name to transform array.
+        :param pairs: List of (group_a, group_b, min_distance) tuples.
+        :return: Index of the very first pose with collision along transforms, or None if no collisions.
+        """
+        return self._internal.check_first(transforms, pairs)
+
     def to_bytes(self) -> bytes:
         """Serialize the world to bytes (includes pre-built BVHs)."""
         return self._internal.to_bytes()

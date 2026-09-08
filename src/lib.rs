@@ -894,6 +894,38 @@ impl CollisionWorld {
         Ok(result)
     }
 
+    /// Check for the very first collision along the transforms
+    ///
+    /// Returns: Optional[int] - index of first pose with collision, or None
+    fn check_first<'py>(
+        &self,
+        _py: Python<'py>,
+        transforms: &Bound<'py, PyDict>,
+        pairs: &Bound<'py, PyList>,
+    ) -> PyResult<Option<usize>> {
+        let pair_vec = parse_pairs(pairs)?;
+        let pair_indices = self.validate_pairs(&pair_vec)?;
+        let (transform_arrays, batch_size) = self.parse_transforms(transforms)?;
+        let group_data = self.prepare_group_data();
+
+        // Use find_first for early exit - returns first collision found by all threads
+        let n = batch_size.unwrap_or(1);
+        let result: Option<usize> = (0..n)
+            .into_par_iter()
+            .find_first(|&pose_idx| {
+                let isometries = self.build_pose_isometries(
+                    pose_idx, &transform_arrays, &group_data);
+
+                // Check if any pair collides
+                pair_indices
+                    .iter()
+                    .any(|&(idx_a, idx_b, min_dist)|
+                        check_pair(idx_a, idx_b, min_dist, &isometries, &group_data))
+            });
+
+        Ok(result)
+    }
+
     /// Serialize to bytes.
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let bytes = bincode::serialize(&self.data)

@@ -172,12 +172,17 @@ collisions = world.check(single_transforms, pairs)  # (n_pairs,) bool array
 
 ```python
 # Stop at first collision found (faster for validation)
-result = world.check_any(transforms, pairs)
-# Returns: Optional[int] - index of first pose with collision, or None
+any_idx = world.check_any(transforms, pairs)
+# Stop at the very first collision (slightly slower)
+first_idx = world.check_first(transforms, pairs)
+# Both Return: Optional[int] - index of first pose with collision, or None
 
-if result is not None:
-    print(f"Collision found at pose {result}")
+if any_idx is not None:
+    assert first_idx <= any_idx # always True
+    print(f"Collision found at pose {any_idx}")
+    print(f"First collision at pose {first_idx}")
 else:
+    assert first_idx is any_idx is None # always True
     print("Path is collision-free")
 
 # Note: Due to parallel execution, this may not return the

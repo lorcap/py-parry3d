@@ -204,6 +204,20 @@ class CollisionWorld:
         :return: Index of first pose with collision, or None if no collisions.
         """
 
+    def check_first(
+        self,
+        transforms: TransformDict,
+        pairs: PairList,
+    ) -> Optional[int]:
+        """
+        Check for the first collision along transforms.
+
+        :param transforms: Dict mapping dynamic group name to transform array.
+        :param pairs: List of (group_a, group_b, min_distance) tuples.
+        :return: Index of the very first pose with collision along transforms, or None if no collisions.
+        """
+        ...
+
     def to_bytes(self) -> bytes:
         """Serialize the world to bytes (includes pre-built BVHs)."""
 
@@ -263,7 +277,7 @@ def set_num_threads(n: int) -> bool:
     """
     Set the number of threads for parallel operations.
 
-    Must be called BEFORE the first parallel operation (check/check_any).
+    Must be called BEFORE the first parallel operation (check/check_any/check_first).
     Once the thread pool is initialized, this function has no effect.
 
     :param n: Number of threads to use.

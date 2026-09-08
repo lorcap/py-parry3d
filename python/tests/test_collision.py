@@ -316,6 +316,39 @@ class TestCheckAny:
         assert result >= 5  # Should be one of the colliding poses
 
 
+class TestCheckFirst:
+    """Test first collision checking."""
+
+    def test_check_first_no_collision(self):
+        """No collisions returns None."""
+        g1 = pp.CollisionGroup("a", [pp.Sphere(0.1)])
+        tf = np.eye(4, dtype=np.float64)
+        g2 = pp.CollisionGroup("b", [pp.Sphere(0.1)], static=True, transform=tf)
+        world = pp.CollisionWorld([g1, g2])
+
+        # Move a far from b
+        transforms = np.tile(np.eye(4), (10, 1, 1)).astype(np.float64)
+        transforms[:, 0, 3] = 10.0  # Far apart
+
+        result = world.check_first({"a": transforms}, [("a", "b", 0.0)])
+        assert result is None
+
+    def test_check_first_with_collision(self):
+        """Collision returns index."""
+        g1 = pp.CollisionGroup("a", [pp.Sphere(0.1)])
+        tf = np.eye(4, dtype=np.float64)
+        g2 = pp.CollisionGroup("b", [pp.Sphere(0.1)], static=True, transform=tf)
+        world = pp.CollisionWorld([g1, g2])
+
+        transforms = np.tile(np.eye(4), (10, 1, 1)).astype(np.float64)
+        transforms[:5, 0, 3] = 10.0  # First 5 far apart
+        transforms[5:, 0, 3] = 0.0   # Last 5 colliding
+
+        result = world.check_first({"a": transforms}, [("a", "b", 0.0)])
+        assert result is not None
+        assert result == 5
+
+
 class TestThreading:
     """Test threading configuration."""
 
