@@ -720,6 +720,13 @@ impl CollisionGroup {
 // CollisionWorld
 // ============================================================================
 
+struct GroupCheckData {
+    shape: SharedShape,
+    is_static: bool,
+    static_isometry: Option<Pose3>,
+    local_offset: Pose3,
+}
+
 #[derive(Serialize, Deserialize)]
 struct CollisionWorldData {
     groups: Vec<CollisionGroup>,
@@ -818,20 +825,106 @@ impl CollisionWorld {
         transforms: &Bound<'py, PyDict>,
         pairs: &Bound<'py, PyList>,
     ) -> PyResult<Py<PyAny>> {
-        // Parse pairs (3-tuples with min_distance)
         let pair_vec = parse_pairs(pairs)?;
+        let pair_indices = self.validate_pairs(&pair_vec)?;
+        let (transform_arrays, batch_size) = self.parse_transforms(transforms)?;
+        let group_data = self.prepare_group_data();
 
-        // Validate pair group names
-        for (a, b, _) in &pair_vec {
-            if !self.data.group_indices.contains_key(a) {
-                return Err(PyValueError::new_err(format!("Unknown group: '{}'", a)));
-            }
-            if !self.data.group_indices.contains_key(b) {
-                return Err(PyValueError::new_err(format!("Unknown group: '{}'", b)));
-            }
+        // Perform collision checking in parallel
+        let n = batch_size.unwrap_or(1);
+        let results: Vec<Vec<bool>> = (0..n)
+            .into_par_iter()
+            .map(|pose_idx| {
+                let isometries = self.build_pose_isometries(
+                    pose_idx, &transform_arrays, &group_data);
+
+                // Check each pair
+                pair_indices
+                    .iter()
+                    .map(|&(idx_a, idx_b, min_dist)|
+                        check_pair(idx_a, idx_b, min_dist, &isometries, &group_data))
+                    .collect()
+            })
+            .collect();
+
+        // Convert to numpy array
+        if n == 1 {
+            // Return (n_pairs,) array
+            let result = results[0].clone().into_pyarray(py);
+            Ok(result.into_any().unbind())
+        } else {
+            // Return (N, n_pairs) array - flatten and reshape
+            let flat: Vec<bool> = results.into_iter().flatten().collect();
+            let arr = flat.into_pyarray(py);
+            let n_pairs = pair_indices.len();
+            let reshaped = arr.reshape([n, n_pairs])?;
+            Ok(reshaped.into_any().unbind())
+        }
+    }
+
+    /// Check for any collision, returning early on first hit.
+    ///
+    /// Returns: Optional[int] - index of first pose with collision, or None
+    fn check_any<'py>(
+        &self,
+        _py: Python<'py>,
+        transforms: &Bound<'py, PyDict>,
+        pairs: &Bound<'py, PyList>,
+    ) -> PyResult<Option<usize>> {
+        let pair_vec = parse_pairs(pairs)?;
+        let pair_indices = self.validate_pairs(&pair_vec)?;
+        let (transform_arrays, batch_size) = self.parse_transforms(transforms)?;
+        let group_data = self.prepare_group_data();
+
+        // Use find_any for early exit - returns first collision found by any thread
+        let n = batch_size.unwrap_or(1);
+        let result: Option<usize> = (0..n)
+            .into_par_iter()
+            .find_any(|&pose_idx| {
+                let isometries = self.build_pose_isometries(
+                    pose_idx, &transform_arrays, &group_data);
+
+                // Check if any pair collides
+                pair_indices
+                    .iter()
+                    .any(|&(idx_a, idx_b, min_dist)|
+                        check_pair(idx_a, idx_b, min_dist, &isometries, &group_data))
+            });
+
+        Ok(result)
+    }
+
+    /// Serialize to bytes.
+    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = bincode::serialize(&self.data)
+            .map_err(|e| PyValueError::new_err(format!("Serialization error: {}", e)))?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Deserialize from bytes.
+    #[staticmethod]
+    fn from_bytes(_py: Python<'_>, data: &Bound<'_, PyBytes>) -> PyResult<Self> {
+        let bytes = data.as_bytes();
+        let mut world_data: CollisionWorldData = bincode::deserialize(bytes)
+            .map_err(|e| PyValueError::new_err(format!("Deserialization error: {}", e)))?;
+
+        // Rebuild cached shapes
+        let mut shapes = Vec::new();
+        for group in &mut world_data.groups {
+            shapes.push(group.build_shape());
         }
 
-        // Parse transforms and determine batch size
+        Ok(CollisionWorld {
+            data: world_data,
+            shapes,
+        })
+    }
+
+    /// Parse transforms and determine batch size
+    fn parse_transforms<'py>(
+        &self,
+        transforms: &Bound<'py, PyDict>,
+    ) -> PyResult<(HashMap<String, Vec<[[f64; 4]; 4]>>, Option<usize>)> {
         let mut transform_arrays: HashMap<String, Vec<[[f64; 4]; 4]>> = HashMap::new();
         let mut batch_size: Option<usize> = None;
 
@@ -901,302 +994,9 @@ impl CollisionWorld {
                     dynamic_name
                 )));
             }
-        }
+        };
 
-        let n = batch_size.unwrap_or(1);
-        let n_pairs = pair_vec.len();
-
-        // Convert pairs to indices for faster access
-        let pair_indices: Vec<(usize, usize, f64)> = pair_vec
-            .iter()
-            .map(|(a, b, min_dist)| {
-                (self.data.group_indices[a], self.data.group_indices[b], *min_dist)
-            })
-            .collect();
-
-        // Prepare group data for collision checking
-        struct GroupCheckData {
-            shape: SharedShape,
-            is_static: bool,
-            static_isometry: Option<Pose3>,
-            local_offset: Pose3,
-        }
-
-        let group_data: Vec<GroupCheckData> = self.data.groups
-            .iter()
-            .zip(self.shapes.iter())
-            .map(|(g, s)| GroupCheckData {
-                shape: s.0.clone(),
-                local_offset: s.1,
-                is_static: g.is_static,
-                static_isometry: g.get_static_isometry(),
-            })
-            .collect();
-
-        // Perform collision checking in parallel
-        let results: Vec<Vec<bool>> = (0..n)
-            .into_par_iter()
-            .map(|pose_idx| {
-                // Build isometries for this pose
-                let mut isometries: Vec<Option<Pose3>> = vec![None; self.data.groups.len()];
-
-                for (name, tfs) in &transform_arrays {
-                    let group_idx = self.data.group_indices[name];
-                    isometries[group_idx] = Some(matrix4_to_isometry(&tfs[pose_idx]));
-                }
-
-                // Set static isometries
-                for (idx, gd) in group_data.iter().enumerate() {
-                    if gd.is_static {
-                        isometries[idx] = gd.static_isometry.clone();
-                    }
-                    // A lone object's local transform lives here, not in the
-                    // shape — compose it onto the group pose once per pose.
-                    if let Some(iso) = &isometries[idx] {
-                        isometries[idx] = Some(iso * gd.local_offset);
-                    }
-                }
-
-                // Check each pair
-                pair_indices
-                    .iter()
-                    .map(|&(idx_a, idx_b, min_dist)| {
-                        let iso_a = match &isometries[idx_a] {
-                            Some(iso) => iso,
-                            None => return false, // NaN or missing
-                        };
-                        let iso_b = match &isometries[idx_b] {
-                            Some(iso) => iso,
-                            None => return false,
-                        };
-
-                        let shape_a = &group_data[idx_a].shape;
-                        let shape_b = &group_data[idx_b].shape;
-
-                        if min_dist > 0.0 {
-                            // Use distance query with threshold
-                            let dist = query::distance(iso_a, shape_a.as_ref(), iso_b, shape_b.as_ref())
-                                .unwrap_or(f64::MAX);
-                            dist < min_dist
-                        } else {
-                            // Use faster intersection test
-                            query::intersection_test(iso_a, shape_a.as_ref(), iso_b, shape_b.as_ref())
-                                .unwrap_or(false)
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
-
-        // Convert to numpy array
-        if n == 1 {
-            // Return (n_pairs,) array
-            let result = results[0].clone().into_pyarray(py);
-            Ok(result.into_any().unbind())
-        } else {
-            // Return (N, n_pairs) array - flatten and reshape
-            let flat: Vec<bool> = results.into_iter().flatten().collect();
-            let arr = flat.into_pyarray(py);
-            let reshaped = arr.reshape([n, n_pairs])?;
-            Ok(reshaped.into_any().unbind())
-        }
-    }
-
-    /// Check for any collision, returning early on first hit.
-    ///
-    /// Returns: Optional[int] - index of first pose with collision, or None
-    fn check_any<'py>(
-        &self,
-        _py: Python<'py>,
-        transforms: &Bound<'py, PyDict>,
-        pairs: &Bound<'py, PyList>,
-    ) -> PyResult<Option<usize>> {
-        // Parse pairs (3-tuples with min_distance)
-        let pair_vec = parse_pairs(pairs)?;
-
-        // Validate pair group names
-        for (a, b, _) in &pair_vec {
-            if !self.data.group_indices.contains_key(a) {
-                return Err(PyValueError::new_err(format!("Unknown group: '{}'", a)));
-            }
-            if !self.data.group_indices.contains_key(b) {
-                return Err(PyValueError::new_err(format!("Unknown group: '{}'", b)));
-            }
-        }
-
-        // Parse transforms and determine batch size
-        let mut transform_arrays: HashMap<String, Vec<[[f64; 4]; 4]>> = HashMap::new();
-        let mut batch_size: Option<usize> = None;
-
-        for dynamic_name in &self.data.dynamic_group_names {
-            let arr_obj = transforms.get_item(dynamic_name)?;
-            if arr_obj.is_none() {
-                return Err(PyValueError::new_err(format!(
-                    "Missing transform for dynamic group: '{}'",
-                    dynamic_name
-                )));
-            }
-            let arr_obj = arr_obj.unwrap();
-
-            let arr_any = arr_obj;
-
-            if let Ok(arr4) = arr_any.extract::<PyReadonlyArray3<f64>>() {
-                let shape = arr4.shape();
-                if shape[1] != 4 || shape[2] != 4 {
-                    return Err(PyValueError::new_err(format!(
-                        "Transform for '{}' must be (N, 4, 4) or (4, 4)",
-                        dynamic_name
-                    )));
-                }
-                let n = shape[0];
-
-                if let Some(bs) = batch_size {
-                    if bs != n {
-                        return Err(PyValueError::new_err(
-                            "All transform arrays must have same batch size"
-                        ));
-                    }
-                } else {
-                    batch_size = Some(n);
-                }
-
-                let slice = arr4.as_slice()?;
-                let mut tfs = Vec::with_capacity(n);
-                for i in 0..n {
-                    let base = i * 16;
-                    let m = [
-                        [slice[base], slice[base+1], slice[base+2], slice[base+3]],
-                        [slice[base+4], slice[base+5], slice[base+6], slice[base+7]],
-                        [slice[base+8], slice[base+9], slice[base+10], slice[base+11]],
-                        [slice[base+12], slice[base+13], slice[base+14], slice[base+15]],
-                    ];
-                    validate_rigid_transform(&m, &format!("Transform for '{}' at index {}: ", dynamic_name, i))?;
-                    tfs.push(m);
-                }
-                transform_arrays.insert(dynamic_name.clone(), tfs);
-            } else if let Ok(arr2) = arr_any.extract::<PyReadonlyArray2<f64>>() {
-                let tf = extract_transform_4x4(&arr2)?;
-                if batch_size.is_none() {
-                    batch_size = Some(1);
-                } else if batch_size != Some(1) {
-                    return Err(PyValueError::new_err(
-                        "Mixing single and batch transforms"
-                    ));
-                }
-                transform_arrays.insert(dynamic_name.clone(), vec![tf]);
-            } else {
-                return Err(PyValueError::new_err(format!(
-                    "Transform for '{}' must be numpy array",
-                    dynamic_name
-                )));
-            }
-        }
-
-        let n = batch_size.unwrap_or(1);
-
-        // Convert pairs to indices for faster access
-        let pair_indices: Vec<(usize, usize, f64)> = pair_vec
-            .iter()
-            .map(|(a, b, min_dist)| {
-                (self.data.group_indices[a], self.data.group_indices[b], *min_dist)
-            })
-            .collect();
-
-        // Prepare group data
-        struct GroupCheckData {
-            shape: SharedShape,
-            is_static: bool,
-            static_isometry: Option<Pose3>,
-            local_offset: Pose3,
-        }
-
-        let group_data: Vec<GroupCheckData> = self.data.groups
-            .iter()
-            .zip(self.shapes.iter())
-            .map(|(g, s)| GroupCheckData {
-                shape: s.0.clone(),
-                local_offset: s.1,
-                is_static: g.is_static,
-                static_isometry: g.get_static_isometry(),
-            })
-            .collect();
-
-        // Use find_any for early exit - returns first collision found by any thread
-        let result: Option<usize> = (0..n)
-            .into_par_iter()
-            .find_any(|&pose_idx| {
-                // Build isometries for this pose
-                let mut isometries: Vec<Option<Pose3>> = vec![None; self.data.groups.len()];
-
-                for (name, tfs) in &transform_arrays {
-                    let group_idx = self.data.group_indices[name];
-                    isometries[group_idx] = Some(matrix4_to_isometry(&tfs[pose_idx]));
-                }
-
-                // Set static isometries
-                for (idx, gd) in group_data.iter().enumerate() {
-                    if gd.is_static {
-                        isometries[idx] = gd.static_isometry.clone();
-                    }
-                    // A lone object's local transform lives here, not in the
-                    // shape — compose it onto the group pose once per pose.
-                    if let Some(iso) = &isometries[idx] {
-                        isometries[idx] = Some(iso * gd.local_offset);
-                    }
-                }
-
-                // Check if any pair collides
-                pair_indices.iter().any(|&(idx_a, idx_b, min_dist)| {
-                    let iso_a = match &isometries[idx_a] {
-                        Some(iso) => iso,
-                        None => return false,
-                    };
-                    let iso_b = match &isometries[idx_b] {
-                        Some(iso) => iso,
-                        None => return false,
-                    };
-
-                    let shape_a = &group_data[idx_a].shape;
-                    let shape_b = &group_data[idx_b].shape;
-
-                    if min_dist > 0.0 {
-                        let dist = query::distance(iso_a, shape_a.as_ref(), iso_b, shape_b.as_ref())
-                            .unwrap_or(f64::MAX);
-                        dist < min_dist
-                    } else {
-                        query::intersection_test(iso_a, shape_a.as_ref(), iso_b, shape_b.as_ref())
-                            .unwrap_or(false)
-                    }
-                })
-            });
-
-        Ok(result)
-    }
-
-    /// Serialize to bytes.
-    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = bincode::serialize(&self.data)
-            .map_err(|e| PyValueError::new_err(format!("Serialization error: {}", e)))?;
-        Ok(PyBytes::new(py, &bytes))
-    }
-
-    /// Deserialize from bytes.
-    #[staticmethod]
-    fn from_bytes(_py: Python<'_>, data: &Bound<'_, PyBytes>) -> PyResult<Self> {
-        let bytes = data.as_bytes();
-        let mut world_data: CollisionWorldData = bincode::deserialize(bytes)
-            .map_err(|e| PyValueError::new_err(format!("Deserialization error: {}", e)))?;
-
-        // Rebuild cached shapes
-        let mut shapes = Vec::new();
-        for group in &mut world_data.groups {
-            shapes.push(group.build_shape());
-        }
-
-        Ok(CollisionWorld {
-            data: world_data,
-            shapes,
-        })
+        Ok((transform_arrays, batch_size))
     }
 
     fn __getstate__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
@@ -1223,6 +1023,78 @@ impl CollisionWorld {
         let cls = py.get_type::<CollisionWorld>();
         let state = self.to_bytes(py)?;
         Ok((cls.getattr("from_bytes")?.into(), (state,)))
+    }
+}
+
+impl CollisionWorld {
+    /// Validate pair group names
+    fn validate_pairs(
+        &self,
+        pair_vec: &Vec<(String, String, f64)>,
+    ) -> PyResult<Vec<(usize, usize, f64)>> {
+        for (a, b, _) in pair_vec {
+            if !self.data.group_indices.contains_key(a) {
+                return Err(PyValueError::new_err(format!("Unknown group: '{}'", a)));
+            }
+            if !self.data.group_indices.contains_key(b) {
+                return Err(PyValueError::new_err(format!("Unknown group: '{}'", b)));
+            }
+        }
+
+        // Convert pairs to indices for faster access
+        let pair_indices: Vec<(usize, usize, f64)> = pair_vec
+            .iter()
+            .map(|(a, b, min_dist)| {
+                (self.data.group_indices[a], self.data.group_indices[b], *min_dist)
+            })
+            .collect();
+
+        Ok(pair_indices)
+    }
+
+    /// Prepare group data for collision checking
+    fn prepare_group_data(
+        &self,
+    ) -> Vec<GroupCheckData> {
+        self.data.groups
+            .iter()
+            .zip(self.shapes.iter())
+            .map(|(g, s)| GroupCheckData {
+                shape: s.0.clone(),
+                local_offset: s.1,
+                is_static: g.is_static,
+                static_isometry: g.get_static_isometry(),
+            })
+            .collect()
+    }
+
+    /// Build isometries for a pose
+    fn build_pose_isometries(
+        &self,
+        pose_idx: usize,
+        transform_arrays: &HashMap<String, Vec<[[f64; 4]; 4]>>,
+        group_data: &Vec<GroupCheckData>,
+    ) -> Vec<Option<Pose3>> {
+        let mut isometries: Vec<Option<Pose3>> = vec![None; self.data.groups.len()];
+
+        for (name, tfs) in transform_arrays {
+            let group_idx = self.data.group_indices[name];
+            isometries[group_idx] = Some(matrix4_to_isometry(&tfs[pose_idx]));
+        }
+
+        // Set static isometries
+        for (idx, gd) in group_data.iter().enumerate() {
+            if gd.is_static {
+                isometries[idx] = gd.static_isometry.clone();
+            }
+            // A lone object's local transform lives here, not in the
+            // shape — compose it onto the group pose once per pose.
+            if let Some(iso) = &isometries[idx] {
+                isometries[idx] = Some(iso * gd.local_offset);
+            }
+        }
+
+        isometries
     }
 }
 
@@ -1282,6 +1154,38 @@ fn parse_pairs(pairs: &Bound<'_, PyList>) -> PyResult<Vec<(String, String, f64)>
             Ok((a, b, min_dist))
         })
         .collect()
+}
+
+/// Check for collision in a pair
+fn check_pair(
+    idx_a: usize,
+    idx_b: usize,
+    min_dist: f64,
+    isometries: &Vec<Option<Pose3>>,
+    group_data: &[GroupCheckData],
+) -> bool {
+    let iso_a = match &isometries[idx_a] {
+        Some(iso) => iso,
+        None => return false, // NaN or missing
+    };
+    let iso_b = match &isometries[idx_b] {
+        Some(iso) => iso,
+        None => return false,
+    };
+
+    let shape_a = &group_data[idx_a].shape;
+    let shape_b = &group_data[idx_b].shape;
+
+    if min_dist > 0.0 {
+        // Use distance query with threshold
+        let dist = query::distance(iso_a, shape_a.as_ref(), iso_b, shape_b.as_ref())
+            .unwrap_or(f64::MAX);
+        dist < min_dist
+    } else {
+        // Use faster intersection test
+        query::intersection_test(iso_a, shape_a.as_ref(), iso_b, shape_b.as_ref())
+            .unwrap_or(false)
+    }
 }
 
 /// Best-effort type name for use in error messages.
