@@ -103,7 +103,7 @@ result = world.check(transforms, pairs)  # (N, n_pairs) bool array
 # Early-exit (stops at first collision found)
 idx = world.check_any(transforms, pairs)  # int or None
 # Early-exit (stops at the very first collision)
-idx = world.check_first(transforms, pairs)  # int or None
+first = world.check_first(transforms, pairs)  # (int, n_pairs) or None
 ```
 
 ### Pair Helpers

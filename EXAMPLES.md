@@ -172,23 +172,31 @@ collisions = world.check(single_transforms, pairs)  # (n_pairs,) bool array
 
 ```python
 # Stop at first collision found (faster for validation)
-any_idx = world.check_any(transforms, pairs)
-# Stop at the very first collision (slightly slower)
-first_idx = world.check_first(transforms, pairs)
-# Both Return: Optional[int] - index of first pose with collision, or None
-
-if any_idx is not None:
-    assert first_idx <= any_idx # always True
-    print(f"Collision found at pose {any_idx}")
-    print(f"First collision at pose {first_idx}")
-else:
-    assert first_idx is any_idx is None # always True
-    print("Path is collision-free")
-
+# Return: Optional[int] - index of first pose with collision, or None
+#
 # Note: Due to parallel execution, this may not return the
 # chronologically-first collision. It returns the first collision
 # found by any thread. For paths where the goal is no collisions,
 # this is sufficient and much faster than full batch check.
+any_idx = world.check_any(transforms, pairs)
+
+# Stop at the very first collision (slightly slower)
+# Return: Optional[tuple[int, n_pairs]] - first pose with collisions, or None
+#
+# Note: Due to parallel execution, when a thread finds a collision, all
+# preceding threads must be waited and checked for a previous collision along
+# the path. This makes `check_first()` slower than `check_any()`, but faster
+# than `check()` in case of many collisions.
+first = world.check_first(transforms, pairs)
+
+if any_idx is not None:
+    first_idx, first_collisions = first
+    assert first_idx <= any_idx # always True
+    print(f"Collision found at pose {any_idx}")
+    print(f"First collision at pose {first_idx}")
+else:
+    assert first is any_idx is None # always True
+    print("Path is collision-free")
 ```
 
 ## Memory Layout

@@ -106,9 +106,11 @@ Helper functions:
 
 - `world.check(transforms, pairs)` → `(N, n_pairs)` bool array
 - `world.check_any(transforms, pairs)` → any collision index or None (early-exit)
-- `world.check_first(transforms, pairs)` → first collision index or None (early-exit)
+- `world.check_first(transforms, pairs)` → first collision (index and bool array) or None (early-exit)
 
 **Transform validation**: every 4x4 transform must be rigid - proper rotation (orthonormal, determinant +1) in the 3x3 block, `[0, 0, 0, 1]` bottom row, all entries finite. Violations raise `ValueError` at the Python boundary; NaN/Inf poses are rejected rather than silently answered. Orthonormality tolerance is 1e-6.
+
+While `worl.check()` aims at completeness, `world.check_any()` shall be the fastest. `world.check_first()` provides a fast and complete answer when seeking for the first collision along a path.
 
 ---
 

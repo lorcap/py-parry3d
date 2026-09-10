@@ -346,7 +346,7 @@ class TestCheckFirst:
 
         result = world.check_first({"a": transforms}, [("a", "b", 0.0)])
         assert result is not None
-        assert result == 5
+        assert result == (5, np.array([True]))
 
 
 class TestThreading:

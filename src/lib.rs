@@ -896,34 +896,39 @@ impl CollisionWorld {
 
     /// Check for the very first collision along the transforms
     ///
-    /// Returns: Optional[int] - index of first pose with collision, or None
+    /// Returns: Optional[tuple[int, np.array[bool]] - index of first pose with collision, or None
     fn check_first<'py>(
         &self,
-        _py: Python<'py>,
+        py: Python<'py>,
         transforms: &Bound<'py, PyDict>,
         pairs: &Bound<'py, PyList>,
-    ) -> PyResult<Option<usize>> {
+    ) -> PyResult<Option<(usize, Py<PyAny>)>> {
         let pair_vec = parse_pairs(pairs)?;
         let pair_indices = self.validate_pairs(&pair_vec)?;
         let (transform_arrays, batch_size) = self.parse_transforms(transforms)?;
         let group_data = self.prepare_group_data();
 
-        // Use find_first for early exit - returns first collision found by all threads
+        // Use find_map_first for early exit - returns first collision found by all threads
         let n = batch_size.unwrap_or(1);
-        let result: Option<usize> = (0..n)
+        let result: Option<(usize, Vec<bool>)> = (0..n)
             .into_par_iter()
-            .find_first(|&pose_idx| {
+            .find_map_first(|pose_idx| {
                 let isometries = self.build_pose_isometries(
                     pose_idx, &transform_arrays, &group_data);
 
-                // Check if any pair collides
-                pair_indices
+                // Check each pair
+                let collisions: Vec<bool> = pair_indices
                     .iter()
-                    .any(|&(idx_a, idx_b, min_dist)|
+                    .map(|&(idx_a, idx_b, min_dist)|
                         check_pair(idx_a, idx_b, min_dist, &isometries, &group_data))
+                    .collect();
+
+                // Return (index, (n_pairs,)) in case of collision
+                collisions.iter().any(|&b| b).then_some((pose_idx, collisions))
             });
 
-        Ok(result)
+        // tuple (index, (n_pairs,)), where (n_pairs,) is numpy array
+        Ok(result.map(|(idx, vec)| (idx, vec.into_pyarray(py).into_any().unbind())))
     }
 
     /// Serialize to bytes.
